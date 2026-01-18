@@ -457,19 +457,15 @@ def chat():
                 timings["stt_start"] = time.time()
                 load_whisper_model()
                 
-                # Debug: Check if file exists and is readable
-                if not os.path.exists(audio_path):
-                    raise FileNotFoundError(f"Audio file not found: {audio_path}")
-                
-                actual_file_size = os.path.getsize(audio_path)
-                print(f"Transcribing audio file: {audio_path} (size: {actual_file_size} bytes)")
+                load_whisper_model()
+                print(f"Transcribing audio file: {audio_path}")
                 
                 # mlx_whisper.transcribe() uses ffmpeg internally to convert audio
                 # It accepts WebM, MP3, WAV, etc. and handles conversion automatically
                 transcription_result = mlx_whisper.transcribe(
                     audio_path,
                     path_or_hf_repo=config.WHISPER_MODEL,
-                    verbose=True,  # Enable verbose to see what's happening
+                    verbose=False,  # Disable verbose for cleaner output
                     condition_on_previous_text=False,  # Faster processing, no context dependency
                 )
                 timings["stt_end"] = time.time()
