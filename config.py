@@ -8,7 +8,8 @@ SERVER_HOST = os.getenv("HOST", "127.0.0.1")
 DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
 # Model Paths
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "mlx-community/whisper-tiny")
+# Using base model for better accuracy (tiny was too aggressive at filtering)
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "mlx-community/whisper-base")
 GEMMA_MODEL_PATH = os.getenv(
     "GEMMA_MODEL_PATH",
     "/Users/agada/.lmstudio/models/mlx-community/gemma-3-4b-it-qat-4bit"

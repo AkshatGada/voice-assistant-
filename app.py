@@ -380,6 +380,7 @@ def chat():
     """Complete pipeline: audio → text → LLM → audio"""
     audio_path = None
     response_path = None
+    webm_path = None
     
     # Start timing - this is when we receive the audio (user finished speaking)
     pipeline_start_time = time.time()
@@ -403,40 +404,83 @@ def chat():
         if audio_file.filename == '':
             return jsonify({"error": "No audio file selected"}), 400
         
-        # Step 1: Save uploaded audio temporarily
+        # Step 1: Save uploaded audio temporarily (as WebM initially)
         with tempfile.NamedTemporaryFile(
             delete=False, suffix=".webm", dir=config.TEMP_DIR
         ) as tmp_file:
             audio_file.save(tmp_file.name)
-            audio_path = tmp_file.name
+            webm_path = tmp_file.name
         
         # Check if audio file has content
-        file_size = os.path.getsize(audio_path)
+        file_size = os.path.getsize(webm_path)
         print(f"Uploaded audio file size: {file_size} bytes")
         
-        # Try to get audio duration using soundfile or ffprobe
+        # Convert WebM to WAV format (16kHz mono) for Whisper
+        # Whisper requires 16kHz mono WAV format for best results
+        audio_path = None
         audio_duration = None
         try:
-            import soundfile as sf_check
-            with sf_check.SoundFile(audio_path) as f:
-                audio_duration = len(f) / f.samplerate
-                print(f"Audio duration: {audio_duration:.2f} seconds")
-        except Exception as e:
-            print(f"Could not determine audio duration: {e}")
-            # Try ffprobe as fallback
+            import subprocess
+            
+            # Convert WebM to WAV using ffmpeg with proper format for Whisper
+            wav_path = webm_path.rsplit('.', 1)[0] + '.wav'
+            
+            # Use ffmpeg to convert: WebM -> 16kHz mono WAV
+            # Add audio filters to normalize and boost volume for better transcription
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-i', webm_path,
+                '-ar', str(config.WHISPER_SAMPLE_RATE),  # Sample rate: 16000 Hz
+                '-ac', '1',  # Mono channel
+                '-acodec', 'pcm_s16le',  # PCM 16-bit encoding
+                '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',  # Normalize audio loudness
+                '-f', 'wav',  # WAV format
+                '-y',  # Overwrite output file
+                wav_path
+            ]
+            
+            result = subprocess.run(
+                ffmpeg_cmd,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode != 0:
+                print(f"ffmpeg conversion error: {result.stderr}")
+                raise Exception(f"Failed to convert audio: {result.stderr}")
+            
+            audio_path = wav_path
+            print(f"Converted audio to WAV: {wav_path}")
+            
+            # Get audio duration using ffprobe or soundfile
             try:
-                import subprocess
-                result = subprocess.run(
-                    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if result.returncode == 0:
-                    audio_duration = float(result.stdout.strip())
-                    print(f"Audio duration (from ffprobe): {audio_duration:.2f} seconds")
+                import soundfile as sf_check
+                with sf_check.SoundFile(audio_path) as f:
+                    audio_duration = len(f) / f.samplerate
+                    print(f"Audio duration: {audio_duration:.2f} seconds")
             except Exception:
-                pass
+                # Fallback to ffprobe
+                try:
+                    result = subprocess.run(
+                        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+                         '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if result.returncode == 0:
+                        audio_duration = float(result.stdout.strip())
+                        print(f"Audio duration (from ffprobe): {audio_duration:.2f} seconds")
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            print(f"Audio conversion error: {e}")
+            # Fallback: try using the WebM file directly (may not work well)
+            audio_path = webm_path
+            print(f"Warning: Using WebM file directly (conversion failed): {e}")
+            traceback.print_exc()
         
         if file_size < 1000:  # Less than 1KB is likely empty or corrupted
             return jsonify({
@@ -465,6 +509,10 @@ def chat():
                     path_or_hf_repo=config.WHISPER_MODEL,
                     verbose=False,  # Disable verbose for faster processing
                     condition_on_previous_text=False,  # Faster processing, no context dependency
+                    word_timestamps=False,  # Disable word timestamps for speed
+                    fp16=False,  # Use fp32 for better accuracy
+                    language="en",  # Set language explicitly for better accuracy
+                    initial_prompt="This is a voice assistant conversation.",  # Help Whisper understand context
                 )
                 timings["stt_end"] = time.time()
                 transcribed_text = transcription_result.get("text", "").strip()
@@ -620,12 +668,19 @@ def chat():
             })
         
         finally:
-            # Clean up input audio file
+            # Clean up input audio files (both WebM and converted WAV)
+            cleanup_paths = []
             if audio_path and os.path.exists(audio_path):
+                cleanup_paths.append(audio_path)
+            # Add WebM path if it exists and is different from audio_path
+            if webm_path and os.path.exists(webm_path) and webm_path != audio_path:
+                cleanup_paths.append(webm_path)
+            
+            for path in cleanup_paths:
                 try:
-                    os.unlink(audio_path)
+                    os.unlink(path)
                 except Exception as e:
-                    print(f"Warning: Failed to delete temp audio file: {e}")
+                    print(f"Warning: Failed to delete temp audio file {path}: {e}")
     
     except Exception as e:
         print(f"Chat pipeline error: {e}")
