@@ -959,13 +959,27 @@ def process_audio_streaming(session_id, audio_buffer):
                 print(f"Warning: Failed to delete temp audio file: {e}")
 
 
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully to avoid sentencepiece cleanup crash"""
+    print("\n\n🛑 Shutting down gracefully...")
+    print("💡 Tip: If you see a crash report, it's a harmless sentencepiece cleanup issue.")
+    # Force exit without cleanup to avoid sentencepiece crash
+    import os
+    os._exit(0)
+
 if __name__ == "__main__":
+    # Register signal handlers for graceful shutdown
+    import signal
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     print(f"Starting Voice Assistant server on {config.SERVER_HOST}:{config.SERVER_PORT}")
     print(f"Whisper model: {config.WHISPER_MODEL}")
     print(f"Gemma model: {config.GEMMA_MODEL_PATH}")
     print(f"Kokoro voice: {config.KOKORO_VOICE}")
     print("\n" + "="*60)
     print("Loading models (this may take a minute on first run)...")
+    print("💡 Press Ctrl+C to stop the server")
     print("="*60)
     
     # Eager model loading - pre-load all models before accepting requests
