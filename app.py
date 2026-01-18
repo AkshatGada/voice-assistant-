@@ -207,39 +207,36 @@ def generate_with_streaming_tts(transcribed_text):
     sentence_buffer = ""
     full_text = ""
     audio_chunks = []
-    filler_text = None
-    filler_detected = False
+    filler_synthesized = False
     
     # Stream LLM tokens (with filler enabled)
     for token, current_text in generate_llm_response(transcribed_text, stream=True, use_filler=True):
         sentence_buffer += token
         full_text = current_text
         
-        # Detect filler token (first token, ends with comma, short)
-        if not filler_detected and token.endswith(',') and len(sentence_buffer.strip()) < 10:
+        # Check if this is a filler token (first token, ends with comma)
+        if not filler_synthesized and token.endswith(',') and len(sentence_buffer.strip()) < 10:
+            # Synthesize filler immediately for instant feedback
             filler_text = sentence_buffer.strip()
-            filler_detected = True
-            sentence_buffer = ""  # Clear buffer, will accumulate first sentence after filler
-            continue  # Wait for first sentence to synthesize together
+            if filler_text:
+                for result in tts_pipeline(
+                    filler_text, 
+                    voice=config.KOKORO_VOICE, 
+                    speed=config.KOKORO_SPEED
+                ):
+                    if result.audio is not None:
+                        audio_chunks.append(result.audio.numpy())
+                
+                # Add natural pause after filler (75ms silence)
+                # This masks voice differences and feels natural
+                silence_padding = np.zeros(int(0.075 * config.KOKORO_SAMPLE_RATE), dtype=np.float32)
+                audio_chunks.append(silence_padding)
+                
+                filler_synthesized = True
+                sentence_buffer = ""  # Clear buffer after filler
         
-        # If we have filler and detect first sentence boundary, synthesize them together
-        if filler_detected and filler_text and re.search(r'[.!?]\s*$', sentence_buffer.strip()):
-            # Synthesize filler + first sentence together for seamless voice
-            combined_text = f"{filler_text} {sentence_buffer.strip()}"
-            for result in tts_pipeline(
-                combined_text, 
-                voice=config.KOKORO_VOICE, 
-                speed=config.KOKORO_SPEED
-            ):
-                if result.audio is not None:
-                    audio_chunks.append(result.audio.numpy())
-            
-            filler_detected = False  # Filler is now synthesized
-            filler_text = None
-            sentence_buffer = ""
-        
-        # Detect subsequent sentence boundaries (after filler is done)
-        elif not filler_detected and re.search(r'[.!?]\s*$', sentence_buffer.strip()):
+        # Detect sentence boundaries (., !, ? followed by optional whitespace)
+        elif re.search(r'[.!?]\s*$', sentence_buffer.strip()):
             sentence = sentence_buffer.strip()
             if sentence:
                 # Synthesize this sentence immediately
@@ -253,14 +250,9 @@ def generate_with_streaming_tts(transcribed_text):
             sentence_buffer = ""
     
     # Handle remaining text (if any)
-    remaining_text = sentence_buffer.strip()
-    if remaining_text:
-        # If we still have filler waiting, combine it with remaining text
-        if filler_detected and filler_text:
-            remaining_text = f"{filler_text} {remaining_text}"
-        
+    if sentence_buffer.strip():
         for result in tts_pipeline(
-            remaining_text, 
+            sentence_buffer.strip(), 
             voice=config.KOKORO_VOICE, 
             speed=config.KOKORO_SPEED
         ):
@@ -856,8 +848,7 @@ def process_audio_streaming(session_id, audio_buffer):
         sentence_buffer = ""
         full_text = ""
         audio_chunks = []
-        filler_text = None
-        filler_detected = False
+        filler_synthesized = False
         import re
         
         # Stream LLM tokens (with filler enabled)
@@ -865,44 +856,42 @@ def process_audio_streaming(session_id, audio_buffer):
             sentence_buffer += token
             full_text = current_text
             
-            # Detect filler token (first token, ends with comma, short)
-            if not filler_detected and token.endswith(',') and len(sentence_buffer.strip()) < 10:
+            # Check if this is a filler token (first token, ends with comma)
+            if not filler_synthesized and token.endswith(',') and len(sentence_buffer.strip()) < 10:
+                # Synthesize filler immediately for instant feedback
                 filler_text = sentence_buffer.strip()
-                filler_detected = True
-                sentence_buffer = ""  # Clear buffer, will accumulate first sentence after filler
-                continue  # Wait for first sentence to synthesize together
+                if filler_text:
+                    for result in tts_pipeline(
+                        filler_text,
+                        voice=config.KOKORO_VOICE,
+                        speed=config.KOKORO_SPEED
+                    ):
+                        if result.audio is not None:
+                            audio_chunk = result.audio.numpy()
+                            audio_chunks.append(audio_chunk)
+                            
+                            # Add natural pause after filler (75ms silence)
+                            # This masks voice differences and feels natural
+                            silence_padding = np.zeros(int(0.075 * config.KOKORO_SAMPLE_RATE), dtype=np.float32)
+                            audio_chunks.append(silence_padding)
+                            
+                            # Send audio chunk immediately
+                            wav_buffer = io.BytesIO()
+                            sf.write(wav_buffer, audio_chunk, config.KOKORO_SAMPLE_RATE, format='WAV')
+                            wav_bytes = wav_buffer.getvalue()
+                            audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+                            
+                            socketio.emit('audio_chunk', {
+                                'audio': audio_b64,
+                                'text': filler_text,
+                                'is_filler': True
+                            }, room=session_id)
+                    
+                    filler_synthesized = True
+                    sentence_buffer = ""
             
-            # If we have filler and detect first sentence boundary, synthesize them together
-            if filler_detected and filler_text and re.search(r'[.!?]\s*$', sentence_buffer.strip()):
-                # Synthesize filler + first sentence together for seamless voice
-                combined_text = f"{filler_text} {sentence_buffer.strip()}"
-                for result in tts_pipeline(
-                    combined_text,
-                    voice=config.KOKORO_VOICE,
-                    speed=config.KOKORO_SPEED
-                ):
-                    if result.audio is not None:
-                        audio_chunk = result.audio.numpy()
-                        audio_chunks.append(audio_chunk)
-                        
-                        # Send audio chunk immediately
-                        wav_buffer = io.BytesIO()
-                        sf.write(wav_buffer, audio_chunk, config.KOKORO_SAMPLE_RATE, format='WAV')
-                        wav_bytes = wav_buffer.getvalue()
-                        audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
-                        
-                        socketio.emit('audio_chunk', {
-                            'audio': audio_b64,
-                            'text': combined_text,
-                            'is_filler': False
-                        }, room=session_id)
-                
-                filler_detected = False  # Filler is now synthesized
-                filler_text = None
-                sentence_buffer = ""
-            
-            # Detect subsequent sentence boundaries (after filler is done)
-            elif not filler_detected and re.search(r'[.!?]\s*$', sentence_buffer.strip()):
+            # Detect sentence boundaries
+            elif re.search(r'[.!?]\s*$', sentence_buffer.strip()):
                 sentence = sentence_buffer.strip()
                 if sentence:
                     # Synthesize this sentence immediately
@@ -930,14 +919,9 @@ def process_audio_streaming(session_id, audio_buffer):
                     sentence_buffer = ""
         
         # Handle remaining text (if any)
-        remaining_text = sentence_buffer.strip()
-        if remaining_text:
-            # If we still have filler waiting, combine it with remaining text
-            if filler_detected and filler_text:
-                remaining_text = f"{filler_text} {remaining_text}"
-            
+        if sentence_buffer.strip():
             for result in tts_pipeline(
-                remaining_text,
+                sentence_buffer.strip(),
                 voice=config.KOKORO_VOICE,
                 speed=config.KOKORO_SPEED
             ):
@@ -953,7 +937,7 @@ def process_audio_streaming(session_id, audio_buffer):
                     
                     socketio.emit('audio_chunk', {
                         'audio': audio_b64,
-                        'text': remaining_text,
+                        'text': sentence_buffer.strip(),
                         'is_filler': False
                     }, room=session_id)
         
