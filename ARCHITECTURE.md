@@ -4,22 +4,29 @@
 
 The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processes voice input locally using MLX-accelerated models. All components run on-device with no cloud dependencies.
 
+**Architecture Evolution**: The system has been optimized for sub-1.5s latency using:
+- **WebSocket Streaming**: Real-time audio chunk streaming
+- **Voice Activity Detection (VAD)**: Browser-side auto-stop on speech end
+- **Psychological Latency Masking**: Filler tokens for instant feedback
+- **Progressive Audio Playback**: Stream audio chunks as they're generated
+
 ```
 ┌─────────┐      ┌──────────────┐      ┌──────────┐      ┌──────────┐      ┌─────────┐
 │ Browser │─────▶│ Flask Server │─────▶│  Whisper │─────▶│  Gemma   │─────▶│ Kokoro  │
-│ (WebM)  │      │              │      │   STT    │      │   LLM    │      │   TTS   │
+│ (WebM)  │◀────│  (WebSocket) │      │   STT    │      │   LLM    │      │   TTS   │
+│ + VAD   │      │              │      │          │      │          │      │         │
 └─────────┘      └──────────────┘      └──────────┘      └──────────┘      └─────────┘
      ▲                                       │                  │                 │
      │                                       │                  │                 │
      └─────────────────────────────────────────────────────────────────────────────┘
-                                   Audio Response (WAV)
+                        Streaming Audio Chunks (Progressive Playback)
 ```
 
 ## Components
 
-### 1. Speech-to-Text (STT) - MLX Whisper
+### 1. Speech-to-Text (STT) - Distil-Whisper
 
-**Model**: `mlx-community/whisper-tiny`
+**Model**: `distil-whisper/distil-small.en` (optimized for English, 5x faster than tiny)
 
 **Responsibilities**:
 - Converts WebM audio recordings to text
@@ -28,9 +35,10 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 
 **Technical Details**:
 - **Sample Rate**: 16 kHz mono (automatically converted)
-- **Model Size**: Tiny variant for speed (< 100MB)
+- **Model Size**: Distil-small.en variant (~150MB, optimized for English)
 - **Library**: `mlx_whisper` (Apple MLX framework)
 - **Audio Format**: Accepts WebM/MP3/WAV via ffmpeg
+- **Performance**: ~5x faster than whisper-tiny for English
 
 **Key Features**:
 - Uses ffmpeg internally for format conversion
@@ -72,6 +80,7 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 - **Sample Rate**: 24 kHz
 - **Speed**: 1.15x (15% faster for natural conversation pace)
 - **Language**: American English (`lang_code="a"`)
+- **Precision**: FP16 (optimized for Apple Neural Engine)
 
 **Key Features**:
 - High-quality neural TTS
@@ -93,8 +102,10 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 **Technical Details**:
 - **Audio Format**: `audio/webm;codecs=opus`
 - **Bitrate**: 128 kbps
-- **Recording**: Manual start/stop via button
-- **Playback**: HTML5 Audio element
+- **Recording**: VAD auto-stop or manual button
+- **Playback**: Progressive Web Audio API (streaming chunks)
+- **VAD**: Browser-side Voice Activity Detection (@ricky0123/vad-web)
+- **WebSocket**: Real-time bidirectional communication
 
 ### 5. Flask Backend Server
 
@@ -170,7 +181,7 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 - Consistent response times from first request
 - Models ready immediately after server starts
 
-### 2. Parallel LLM + TTS Streaming
+### 5. Parallel LLM + TTS Streaming
 **What**: Start TTS synthesis as soon as first sentence is generated  
 **Impact**: Reduces perceived latency by ~40-60%  
 **Implementation**:
@@ -184,7 +195,7 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 - LLM and TTS run in parallel after first sentence
 - Total latency: max(LLM_time, TTS_time) instead of sum
 
-### 3. Greedy Decoding (Streaming)
+### 6. Greedy Decoding (Streaming)
 **What**: Use greedy sampler (temp=0) for streaming LLM responses  
 **Impact**: Faster token generation, more deterministic  
 **Implementation**:
@@ -197,7 +208,7 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 - More predictable responses
 - Lower CPU/GPU utilization
 
-### 4. Audio Memory Cache
+### 7. Audio Memory Cache
 **What**: Serve audio directly from memory instead of disk  
 **Impact**: Eliminates file I/O, reduces latency by ~10-50ms  
 **Implementation**:
@@ -211,7 +222,7 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 - Faster audio delivery to frontend
 - Reduced disk I/O operations
 
-### 5. Optimized System Prompt
+### 8. Optimized System Prompt
 **What**: Reduced system prompt from ~1964 to 150 characters  
 **Impact**: Faster LLM processing, lower token costs  
 **Implementation**:
@@ -224,7 +235,7 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 - Lower memory usage for prompt encoding
 - Maintains quality with less overhead
 
-### 6. Reduced LLM Max Tokens
+### 9. Reduced LLM Max Tokens
 **What**: Limit generation to 100 tokens (from 512)  
 **Impact**: Faster LLM inference, more concise responses  
 **Implementation**:
@@ -237,7 +248,7 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 - More focused, concise responses (good for voice)
 - Less GPU/CPU usage per request
 
-### 7. System Prompt Token Caching
+### 10. System Prompt Token Caching
 **What**: Pre-tokenize system prompt for potential KV cache reuse  
 **Impact**: Future optimization (not fully implemented)  
 **Implementation**:
@@ -249,7 +260,7 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 - Infrastructure for future KV cache optimization
 - Potential to skip recomputing system prompt embeddings
 
-### 8. Faster TTS Speech Rate
+### 11. Faster TTS Speech Rate
 **What**: Increase TTS speed to 1.15x (15% faster)  
 **Impact**: Slightly faster audio playback  
 **Implementation**:
@@ -261,7 +272,32 @@ The Voice Assistant is a complete **STT → LLM → TTS pipeline** that processe
 - Slightly reduced perceived latency
 - Still sounds natural (not robotic)
 
-### 9. Condition-on-Previous-Text Disabled
+### 12. Condition-on-Previous-Text Disabled
+
+### 13. Distil-Whisper Model (Phase 4)
+**What**: Switch from whisper-tiny to distil-small.en  
+**Impact**: ~0.2-0.3s reduction in STT latency  
+**Implementation**:
+- `WHISPER_MODEL = "distil-whisper/distil-small.en"`
+- Optimized specifically for English
+- ~5x faster than whisper-tiny
+
+**Benefits**:
+- Faster transcription
+- Better accuracy for English
+- Still lightweight (~150MB)
+
+### 14. FP16 Precision for TTS (Phase 4)
+**What**: Use FP16 precision for Kokoro TTS  
+**Impact**: ~0.1-0.2s reduction (Neural Engine optimization)  
+**Implementation**:
+- `KOKORO_MODEL_PRECISION = "fp16"` in config
+- Leverages Apple Neural Engine acceleration
+
+**Benefits**:
+- Faster TTS synthesis
+- Lower memory usage
+- Better performance on Apple Silicon
 **What**: Disable Whisper's context dependency  
 **Impact**: Faster STT processing  
 **Implementation**:

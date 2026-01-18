@@ -188,8 +188,31 @@
         <audio id="audioPlayer" class="audio-player" controls style="display: none;"></audio>
         
         <div id="error" class="error"></div>
+        
+        <div style="margin-top: 20px; text-align: center;">
+            <label style="display: inline-flex; align-items: center; cursor: pointer; color: #666;">
+                <input type="checkbox" id="vadToggle" checked style="margin-right: 8px; width: 18px; height: 18px;">
+                Auto-detect end of speech
+            </label>
+        </div>
     </div>
 
+    <!-- Socket.IO Client Library -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    
+    <!-- VAD Web Library -->
+    <script type="module">
+        import { MicVAD } from "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/mic-vad/index.js";
+        window.MicVAD = MicVAD;
+    </script>
+    
+    <!-- Progressive Audio Player -->
+    <script src="audio-player.js"></script>
+    
+    <!-- WebSocket Handler -->
+    <script src="websocket-handler.js"></script>
+    
+    <!-- Main App -->
     <script src="app.js"></script>
 </body>
 </html>

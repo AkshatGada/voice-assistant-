@@ -13,6 +13,11 @@ let isRecording = false;
 let recordingStartTime = null;
 const MIN_RECORDING_DURATION = 1000; // Minimum 1 second recording for better transcription
 
+// VAD (Voice Activity Detection) variables
+let vad = null;
+let vadActive = false;
+let vadEnabled = true;
+
 // Check for browser support
 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     showError('Your browser does not support audio recording. Please use Chrome, Firefox, or Edge.');
@@ -24,12 +29,66 @@ navigator.mediaDevices.getUserMedia({ audio: true })
     .then(stream => {
         console.log('Microphone access granted');
         setupMediaRecorder(stream);
+        initVAD(stream);
     })
     .catch(err => {
         console.error('Microphone access denied:', err);
         showError('Microphone access is required. Please allow microphone access and refresh the page.');
         recordButton.disabled = true;
     });
+
+// Initialize VAD (Voice Activity Detection)
+async function initVAD(stream) {
+    // Wait for MicVAD to be available
+    if (typeof window.MicVAD === 'undefined') {
+        console.warn('MicVAD not loaded, retrying...');
+        setTimeout(() => initVAD(stream), 500);
+        return;
+    }
+    
+    try {
+        vad = await window.MicVAD.new({
+            onSpeechStart: () => {
+                console.log("Speech detected - starting recording");
+                if (!isRecording) {
+                    startRecording();
+                }
+            },
+            onSpeechEnd: (audio) => {
+                console.log("Speech ended - auto-stopping");
+                if (isRecording && vadEnabled) {
+                    // Check minimum duration
+                    if (recordingStartTime && (Date.now() - recordingStartTime) >= MIN_RECORDING_DURATION) {
+                        stopRecording();
+                    }
+                }
+            },
+            positiveSpeechThreshold: 0.8,  // Sensitivity for speech detection
+            negativeSpeechThreshold: 0.5,  // Sensitivity for silence detection
+            redemptionFrames: 8,  // Wait 8 frames (400ms) of silence before ending
+            minSpeechFrames: 3,   // Minimum speech duration (frames)
+            workletURL: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/mic-vad/vad.worklet.bundle.min.js",
+            modelURL: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/silero_vad.onnx",
+            sampleRate: 16000
+        });
+        
+        vadActive = true;
+        console.log('VAD initialized successfully');
+    } catch (err) {
+        console.error('Failed to initialize VAD:', err);
+        // Continue without VAD - manual stop button will still work
+        vadActive = false;
+    }
+}
+
+// VAD toggle handler
+const vadToggle = document.getElementById('vadToggle');
+if (vadToggle) {
+    vadToggle.addEventListener('change', (e) => {
+        vadEnabled = e.target.checked;
+        console.log('VAD enabled:', vadEnabled);
+    });
+}
 
 function setupMediaRecorder(stream) {
     // Use MediaRecorder with WAV format if available, otherwise use webm
@@ -43,11 +102,22 @@ function setupMediaRecorder(stream) {
     mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
             audioChunks.push(event.data);
+            
+            // Stream chunk via WebSocket if available
+            if (typeof sendAudioChunk !== 'undefined' && typeof window.useWebSocket !== 'undefined' && window.useWebSocket) {
+                sendAudioChunk(event.data);
+            }
         }
     };
     
     mediaRecorder.onstop = () => {
-        processRecording();
+        // If using WebSocket, signal end
+        if (typeof sendAudioEnd !== 'undefined' && typeof window.useWebSocket !== 'undefined' && window.useWebSocket && typeof window.socket !== 'undefined' && window.socket && window.socket.connected) {
+            sendAudioEnd();
+        } else {
+            // Fallback to HTTP
+            processRecording();
+        }
     };
 }
 
@@ -70,7 +140,7 @@ function startRecording() {
     recordButton.classList.add('recording');
     recordButton.innerHTML = '⏹️<br>Stop<br>Recording';
     statusDiv.className = 'status recording';
-    statusDiv.textContent = 'Recording...';
+    statusDiv.textContent = vadEnabled ? 'Recording... (Auto-stop enabled)' : 'Recording...';
     transcribedTextDiv.textContent = '-';
     responseTextDiv.textContent = '-';
     hideError();
@@ -79,6 +149,13 @@ function startRecording() {
         recordingStartTime = Date.now();
         // Start recording with timeslice to ensure data is captured
         mediaRecorder.start(100); // Collect data every 100ms
+        
+        // Start VAD monitoring if enabled
+        if (vad && vadActive && vadEnabled) {
+            vad.start();
+            console.log('VAD monitoring started');
+        }
+        
         console.log('Recording started');
     } catch (err) {
         console.error('Error starting recording:', err);
@@ -101,6 +178,12 @@ function stopRecording() {
         showError(`Please record for at least ${MIN_RECORDING_DURATION/1000} seconds`);
         // Continue recording
         return;
+    }
+    
+    // Stop VAD monitoring
+    if (vad && vadActive) {
+        vad.pause();
+        console.log('VAD monitoring paused');
     }
     
     // Mark when user finished speaking (end of recording)

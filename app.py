@@ -4,18 +4,26 @@ import os
 import tempfile
 import time
 import traceback
+import io
+import base64
+import threading
 
 import mlx_whisper
 import numpy as np
 import soundfile as sf
 from flask import Flask, jsonify, request, send_file, Response
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 from kokoro import KPipeline
 
 import config
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# Audio buffer for streaming WebSocket
+audio_buffers = {}  # {session_id: BytesIO}
 
 # Global model holders (lazy loading)
 whisper_model_loaded = False
@@ -93,8 +101,17 @@ def load_tts_pipeline():
     
     if tts_pipeline is None:
         try:
-            print(f"Loading Kokoro TTS pipeline (lang={config.KOKORO_LANG_CODE})")
-            tts_pipeline = KPipeline(lang_code=config.KOKORO_LANG_CODE)
+            print(f"Loading Kokoro TTS pipeline (lang={config.KOKORO_LANG_CODE}, precision={config.KOKORO_MODEL_PRECISION})")
+            # Note: FP16 precision optimization depends on Kokoro library support
+            # If precision parameter is not supported, it will use default
+            try:
+                tts_pipeline = KPipeline(
+                    lang_code=config.KOKORO_LANG_CODE,
+                    # precision=config.KOKORO_MODEL_PRECISION  # Uncomment if Kokoro supports this
+                )
+            except TypeError:
+                # Fallback if precision parameter not supported
+                tts_pipeline = KPipeline(lang_code=config.KOKORO_LANG_CODE)
             print("Kokoro TTS pipeline loaded successfully")
         except Exception as e:
             print(f"Error loading Kokoro TTS: {e}")
@@ -102,7 +119,19 @@ def load_tts_pipeline():
             raise
 
 
-def _generate_llm_response_streaming(formatted_prompt: str):
+def _select_filler(prompt: str) -> str:
+    """Select appropriate filler based on prompt type"""
+    prompt_lower = prompt.lower()
+    
+    if any(word in prompt_lower for word in ['what', 'how', 'why', 'when', 'where']):
+        return "Let me see,"
+    elif any(word in prompt_lower for word in ['can you', 'could you', 'would you']):
+        return "Sure,"
+    else:
+        return "Okay,"
+
+
+def _generate_llm_response_streaming(formatted_prompt: str, use_filler: bool = True, user_prompt: str = ""):
     """Internal generator function for streaming LLM responses"""
     global gemma_model, gemma_tokenizer
     from mlx_lm import stream_generate as mlx_stream_generate
@@ -111,6 +140,26 @@ def _generate_llm_response_streaming(formatted_prompt: str):
     # Create a greedy sampler (temp=0) for speed
     def greedy_sampler(logits):
         return mx.argmax(logits, axis=-1)
+    
+    # Handle filler token for psychological latency masking
+    filler = None
+    if use_filler and config.ENABLE_FILLER_TOKENS and user_prompt:
+        filler = _select_filler(user_prompt)
+        # Yield filler immediately before LLM generation
+        yield filler, filler
+        
+        # Modify prompt to continue after filler
+        if hasattr(gemma_tokenizer, "apply_chat_template"):
+            messages = [
+                {"role": "system", "content": config.SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": filler}
+            ]
+            formatted_prompt = gemma_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            formatted_prompt = f"{config.SYSTEM_PROMPT}\n\nUser: {user_prompt}\nAssistant: {filler}"
     
     full_response = formatted_prompt
     for response in mlx_stream_generate(
@@ -134,7 +183,8 @@ def generate_with_streaming_tts(transcribed_text):
     """Generate LLM response with parallel TTS streaming
     
     Starts TTS synthesis as soon as first complete sentence is generated,
-    dramatically reducing perceived latency.
+    dramatically reducing perceived latency. Handles filler tokens for
+    instant feedback.
     
     Returns:
         tuple: (full_text, audio_array)
@@ -146,14 +196,30 @@ def generate_with_streaming_tts(transcribed_text):
     sentence_buffer = ""
     full_text = ""
     audio_chunks = []
+    filler_synthesized = False
     
-    # Stream LLM tokens
-    for token, current_text in generate_llm_response(transcribed_text, stream=True):
+    # Stream LLM tokens (with filler enabled)
+    for token, current_text in generate_llm_response(transcribed_text, stream=True, use_filler=True):
         sentence_buffer += token
         full_text = current_text
         
+        # Check if this is a filler token (first token, ends with comma)
+        if not filler_synthesized and token.endswith(',') and len(sentence_buffer.strip()) < 10:
+            # Synthesize filler immediately for instant feedback
+            filler_text = sentence_buffer.strip()
+            if filler_text:
+                for result in tts_pipeline(
+                    filler_text, 
+                    voice=config.KOKORO_VOICE, 
+                    speed=config.KOKORO_SPEED
+                ):
+                    if result.audio is not None:
+                        audio_chunks.append(result.audio.numpy())
+                filler_synthesized = True
+                sentence_buffer = ""  # Clear buffer after filler
+        
         # Detect sentence boundaries (., !, ? followed by optional whitespace)
-        if re.search(r'[.!?]\s*$', sentence_buffer.strip()):
+        elif re.search(r'[.!?]\s*$', sentence_buffer.strip()):
             sentence = sentence_buffer.strip()
             if sentence:
                 # Synthesize this sentence immediately
@@ -180,12 +246,13 @@ def generate_with_streaming_tts(transcribed_text):
     return full_text, final_audio
 
 
-def generate_llm_response(prompt: str, stream: bool = False):
+def generate_llm_response(prompt: str, stream: bool = False, use_filler: bool = True):
     """Generate response using Gemma LLM
     
     Args:
         prompt: User prompt text
         stream: If True, yields tokens as they're generated. If False, returns full response.
+        use_filler: If True and streaming, prepend filler token for psychological latency masking
     
     Returns:
         If stream=False: Complete response string
@@ -213,7 +280,7 @@ def generate_llm_response(prompt: str, stream: bool = False):
         
         if stream:
             # Streaming mode - return generator from separate function
-            return _generate_llm_response_streaming(formatted_prompt)
+            return _generate_llm_response_streaming(formatted_prompt, use_filler=use_filler, user_prompt=prompt)
         else:
             # Non-streaming mode - return complete response
             from mlx_lm import generate as mlx_generate
@@ -668,6 +735,209 @@ def stream_audio_direct(request_id):
     return jsonify({"error": "Audio not found"}), 404
 
 
+# WebSocket event handlers
+@socketio.on('connect')
+def handle_connect():
+    """Handle WebSocket connection"""
+    session_id = request.sid
+    audio_buffers[session_id] = io.BytesIO()
+    print(f"WebSocket client connected: {session_id}")
+    emit('connected', {'session_id': session_id})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle WebSocket disconnection"""
+    session_id = request.sid
+    if session_id in audio_buffers:
+        del audio_buffers[session_id]
+    print(f"WebSocket client disconnected: {session_id}")
+
+
+@socketio.on('audio_chunk')
+def handle_audio_chunk(data):
+    """Receive streaming audio chunks from browser"""
+    session_id = request.sid
+    chunk = data.get('chunk')  # Base64 encoded audio
+    
+    if not chunk:
+        emit('error', {'message': 'No chunk data provided'}, room=session_id)
+        return
+    
+    try:
+        # Append to buffer
+        audio_data = base64.b64decode(chunk)
+        if session_id in audio_buffers:
+            audio_buffers[session_id].write(audio_data)
+    except Exception as e:
+        print(f"Error processing audio chunk: {e}")
+        emit('error', {'message': f'Error processing chunk: {str(e)}'}, room=session_id)
+
+
+@socketio.on('audio_end')
+def handle_audio_end(data):
+    """Process complete audio when user stops speaking"""
+    session_id = request.sid
+    
+    # Get accumulated audio
+    audio_buffer = audio_buffers.get(session_id)
+    if not audio_buffer or audio_buffer.tell() == 0:
+        emit('error', {'message': 'No audio data received'}, room=session_id)
+        return
+    
+    # Process audio in background thread
+    thread = threading.Thread(
+        target=process_audio_streaming,
+        args=(session_id, audio_buffer)
+    )
+    thread.daemon = True
+    thread.start()
+
+
+def process_audio_streaming(session_id, audio_buffer):
+    """Process audio and stream responses back via WebSocket"""
+    audio_path = None
+    
+    try:
+        # Save accumulated audio to temp file
+        audio_buffer.seek(0)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm", dir=config.TEMP_DIR) as tmp:
+            tmp.write(audio_buffer.read())
+            audio_path = tmp.name
+        
+        # Clear buffer for next recording
+        audio_buffers[session_id] = io.BytesIO()
+        
+        # STT
+        load_whisper_model()
+        transcription_result = mlx_whisper.transcribe(
+            audio_path,
+            path_or_hf_repo=config.WHISPER_MODEL,
+            verbose=False,
+            condition_on_previous_text=False,
+        )
+        
+        transcribed_text = transcription_result.get("text", "").strip()
+        
+        if not transcribed_text:
+            socketio.emit('error', {'message': 'No speech detected in audio'}, room=session_id)
+            return
+        
+        # Send transcription
+        socketio.emit('transcription', {'text': transcribed_text}, room=session_id)
+        
+        # LLM + TTS streaming with filler tokens
+        load_tts_pipeline()
+        
+        sentence_buffer = ""
+        full_text = ""
+        audio_chunks = []
+        filler_synthesized = False
+        import re
+        
+        # Stream LLM tokens (with filler enabled)
+        for token, current_text in generate_llm_response(transcribed_text, stream=True, use_filler=True):
+            sentence_buffer += token
+            full_text = current_text
+            
+            # Check if this is a filler token (first token, ends with comma)
+            if not filler_synthesized and token.endswith(',') and len(sentence_buffer.strip()) < 10:
+                # Synthesize filler immediately for instant feedback
+                filler_text = sentence_buffer.strip()
+                if filler_text:
+                    for result in tts_pipeline(
+                        filler_text,
+                        voice=config.KOKORO_VOICE,
+                        speed=config.KOKORO_SPEED
+                    ):
+                        if result.audio is not None:
+                            audio_chunk = result.audio.numpy()
+                            audio_chunks.append(audio_chunk)
+                            
+                            # Send audio chunk immediately
+                            wav_buffer = io.BytesIO()
+                            sf.write(wav_buffer, audio_chunk, config.KOKORO_SAMPLE_RATE, format='WAV')
+                            wav_bytes = wav_buffer.getvalue()
+                            audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+                            
+                            socketio.emit('audio_chunk', {
+                                'audio': audio_b64,
+                                'text': filler_text,
+                                'is_filler': True
+                            }, room=session_id)
+                    
+                    filler_synthesized = True
+                    sentence_buffer = ""
+            
+            # Detect sentence boundaries
+            elif re.search(r'[.!?]\s*$', sentence_buffer.strip()):
+                sentence = sentence_buffer.strip()
+                if sentence:
+                    # Synthesize this sentence immediately
+                    for result in tts_pipeline(
+                        sentence,
+                        voice=config.KOKORO_VOICE,
+                        speed=config.KOKORO_SPEED
+                    ):
+                        if result.audio is not None:
+                            audio_chunk = result.audio.numpy()
+                            audio_chunks.append(audio_chunk)
+                            
+                            # Send audio chunk immediately
+                            wav_buffer = io.BytesIO()
+                            sf.write(wav_buffer, audio_chunk, config.KOKORO_SAMPLE_RATE, format='WAV')
+                            wav_bytes = wav_buffer.getvalue()
+                            audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+                            
+                            socketio.emit('audio_chunk', {
+                                'audio': audio_b64,
+                                'text': sentence,
+                                'is_filler': False
+                            }, room=session_id)
+                    
+                    sentence_buffer = ""
+        
+        # Handle remaining text (if any)
+        if sentence_buffer.strip():
+            for result in tts_pipeline(
+                sentence_buffer.strip(),
+                voice=config.KOKORO_VOICE,
+                speed=config.KOKORO_SPEED
+            ):
+                if result.audio is not None:
+                    audio_chunk = result.audio.numpy()
+                    audio_chunks.append(audio_chunk)
+                    
+                    # Send audio chunk
+                    wav_buffer = io.BytesIO()
+                    sf.write(wav_buffer, audio_chunk, config.KOKORO_SAMPLE_RATE, format='WAV')
+                    wav_bytes = wav_buffer.getvalue()
+                    audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+                    
+                    socketio.emit('audio_chunk', {
+                        'audio': audio_b64,
+                        'text': sentence_buffer.strip(),
+                        'is_filler': False
+                    }, room=session_id)
+        
+        # Send completion signal
+        socketio.emit('response_complete', {
+            'full_text': full_text
+        }, room=session_id)
+        
+    except Exception as e:
+        print(f"Error in process_audio_streaming: {e}")
+        traceback.print_exc()
+        socketio.emit('error', {'message': f'Processing error: {str(e)}'}, room=session_id)
+    finally:
+        # Clean up temp file
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.unlink(audio_path)
+            except Exception as e:
+                print(f"Warning: Failed to delete temp audio file: {e}")
+
+
 if __name__ == "__main__":
     print(f"Starting Voice Assistant server on {config.SERVER_HOST}:{config.SERVER_PORT}")
     print(f"Whisper model: {config.WHISPER_MODEL}")
@@ -715,7 +985,8 @@ if __name__ == "__main__":
         print("Models will be loaded lazily on first request.")
         traceback.print_exc()
     
-    app.run(
+    socketio.run(
+        app,
         host=config.SERVER_HOST,
         port=config.SERVER_PORT,
         debug=config.DEBUG,
