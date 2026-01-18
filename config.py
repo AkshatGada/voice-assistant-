@@ -8,9 +8,10 @@ SERVER_HOST = os.getenv("HOST", "127.0.0.1")
 DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
 # Model Paths
-# Using distil-whisper for faster STT (5x faster than tiny)
-# Fallback: mlx-community/whisper-tiny if distil-whisper not available
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "distil-whisper/distil-small.en")
+# Note: distil-whisper is not available in MLX format yet
+# Using mlx-community/whisper-small for faster STT (better than tiny)
+# Available MLX models: whisper-tiny, whisper-base, whisper-small, whisper-medium
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "mlx-community/whisper-small")
 GEMMA_MODEL_PATH = os.getenv(
     "GEMMA_MODEL_PATH",
     "/Users/agada/.lmstudio/models/mlx-community/gemma-3-4b-it-qat-4bit"

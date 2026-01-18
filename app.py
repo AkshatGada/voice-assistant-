@@ -952,14 +952,19 @@ if __name__ == "__main__":
         print("\n[1/3] Loading Whisper model...")
         load_whisper_model()
         # Trigger actual model load by doing a dummy transcribe
-        import tempfile
-        import numpy as np
-        # Create a tiny dummy audio file to trigger model load
-        dummy_audio = np.zeros(16000, dtype=np.float32)  # 1 second of silence
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-            sf.write(tmp.name, dummy_audio, config.WHISPER_SAMPLE_RATE)
-            mlx_whisper.transcribe(tmp.name, path_or_hf_repo=config.WHISPER_MODEL, verbose=False)
-        print("✓ Whisper model loaded")
+        try:
+            import tempfile
+            import numpy as np
+            # Create a tiny dummy audio file to trigger model load
+            dummy_audio = np.zeros(16000, dtype=np.float32)  # 1 second of silence
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+                sf.write(tmp.name, dummy_audio, config.WHISPER_SAMPLE_RATE)
+                mlx_whisper.transcribe(tmp.name, path_or_hf_repo=config.WHISPER_MODEL, verbose=False, condition_on_previous_text=False)
+            print("✓ Whisper model loaded")
+        except Exception as e:
+            print(f"⚠️  Warning: Whisper model warmup failed: {e}")
+            print(f"   Model will be loaded lazily on first request.")
+            print(f"   If distil-whisper doesn't work, try: WHISPER_MODEL=mlx-community/whisper-tiny")
         
         print("\n[2/3] Loading Gemma LLM model...")
         load_gemma_model()
