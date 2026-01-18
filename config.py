@@ -35,6 +35,9 @@ SYSTEM_PROMPT = """You are Jarvis, a helpful voice assistant. Provide natural, c
 ENABLE_FILLER_TOKENS = os.getenv("ENABLE_FILLER_TOKENS", "true").lower() == "true"
 FILLER_TOKENS = ["Sure,", "Okay,", "Alright,", "Let me see,"]
 
+# WebSocket Configuration
+ENABLE_WEBSOCKET_MODE = os.getenv("ENABLE_WS", "true").lower() == "true"
+
 # Temporary file storage
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
