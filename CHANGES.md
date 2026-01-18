@@ -44,16 +44,16 @@ ffmpeg_cmd = [
 - Using fp32 for better accuracy: `fp16=False`
 - Kept `condition_on_previous_text=False` for speed
 
-### 3. Upgraded Whisper Model (config.py)
-- Changed from `whisper-tiny` to `whisper-base`
-- Base model provides better accuracy without significant latency increase
-- Tiny model was too aggressive at filtering/rejecting audio
+### 3. Kept Original Whisper Model (config.py)
+- Reverted to `mlx-community/whisper-tiny` (original working model)
+- The issue was audio conversion, not the model itself
+- Tiny model is fast and works well with proper audio normalization
 
 **Expected Results:**
 - Improved transcription accuracy for voice input
 - Better handling of varying audio volumes
 - More reliable STT with proper audio normalization
-- Slightly increased latency (~100-200ms) but much better accuracy
+- No latency increase (still using tiny model)
 
 **Files Modified:**
 - `/Users/agada/voice-assistant/app.py` - Audio conversion and Whisper parameters
