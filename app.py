@@ -224,9 +224,6 @@ def generate_llm_response(prompt: str, stream: bool = False):
                 prompt=formatted_prompt,
                 max_tokens=config.LLM_MAX_TOKENS,
                 verbose=False,
-                temp=0.0,  # Greedy decoding for speed
-                repetition_penalty=1.1,  # Reduce repetitive tokens
-                top_p=0.95,  # Nucleus sampling
             )
             
             # Remove the prompt from response if it was included
