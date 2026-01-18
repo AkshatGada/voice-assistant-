@@ -120,15 +120,26 @@ def load_tts_pipeline():
 
 
 def _select_filler(prompt: str) -> str:
-    """Select appropriate filler based on prompt type"""
+    """Select appropriate filler based on prompt type with randomization"""
+    import random
+    
     prompt_lower = prompt.lower()
     
-    if any(word in prompt_lower for word in ['what', 'how', 'why', 'when', 'where']):
-        return "Let me see,"
-    elif any(word in prompt_lower for word in ['can you', 'could you', 'would you']):
-        return "Sure,"
+    # Different filler sets for different question types
+    if any(word in prompt_lower for word in ['what', 'how', 'why', 'when', 'where', 'which']):
+        # Question fillers
+        fillers = ["Let me see,", "Hmm,", "Well,", "Let me think,", "Good question,", "Interesting,"]
+    elif any(word in prompt_lower for word in ['can you', 'could you', 'would you', 'will you']):
+        # Request fillers
+        fillers = ["Sure,", "Of course,", "Absolutely,", "Certainly,", "Yes,", "Got it,"]
+    elif any(word in prompt_lower for word in ['is', 'are', 'was', 'were', 'do', 'does']):
+        # Yes/no question fillers
+        fillers = ["Well,", "Let me see,", "Hmm,", "Right,", "I see,"]
     else:
-        return "Okay,"
+        # General fillers
+        fillers = ["Okay,", "Alright,", "Right,", "Got it,", "Understood,", "Fair enough,", "Indeed,"]
+    
+    return random.choice(fillers)
 
 
 def _generate_llm_response_streaming(formatted_prompt: str, use_filler: bool = True, user_prompt: str = ""):
@@ -754,44 +765,35 @@ def handle_disconnect():
     print(f"WebSocket client disconnected: {session_id}")
 
 
-@socketio.on('audio_chunk')
-def handle_audio_chunk(data):
-    """Receive streaming audio chunks from browser"""
+@socketio.on('audio_complete')
+def handle_audio_complete(data):
+    """Receive complete audio file from browser"""
     session_id = request.sid
-    chunk = data.get('chunk')  # Base64 encoded audio
+    audio_b64 = data.get('audio')  # Base64 encoded complete audio file
     
-    if not chunk:
-        emit('error', {'message': 'No chunk data provided'}, room=session_id)
+    if not audio_b64:
+        emit('error', {'message': 'No audio data provided'}, room=session_id)
         return
     
     try:
-        # Append to buffer
-        audio_data = base64.b64decode(chunk)
-        if session_id in audio_buffers:
-            audio_buffers[session_id].write(audio_data)
+        # Decode complete audio file
+        audio_data = base64.b64decode(audio_b64)
+        
+        # Create buffer with complete audio
+        audio_buffer = io.BytesIO(audio_data)
+        
+        # Process audio in background thread
+        thread = threading.Thread(
+            target=process_audio_streaming,
+            args=(session_id, audio_buffer)
+        )
+        thread.daemon = True
+        thread.start()
+        
     except Exception as e:
-        print(f"Error processing audio chunk: {e}")
-        emit('error', {'message': f'Error processing chunk: {str(e)}'}, room=session_id)
-
-
-@socketio.on('audio_end')
-def handle_audio_end(data):
-    """Process complete audio when user stops speaking"""
-    session_id = request.sid
-    
-    # Get accumulated audio
-    audio_buffer = audio_buffers.get(session_id)
-    if not audio_buffer or audio_buffer.tell() == 0:
-        emit('error', {'message': 'No audio data received'}, room=session_id)
-        return
-    
-    # Process audio in background thread
-    thread = threading.Thread(
-        target=process_audio_streaming,
-        args=(session_id, audio_buffer)
-    )
-    thread.daemon = True
-    thread.start()
+        print(f"Error processing complete audio: {e}")
+        traceback.print_exc()
+        emit('error', {'message': f'Error processing audio: {str(e)}'}, room=session_id)
 
 
 def process_audio_streaming(session_id, audio_buffer):
@@ -801,8 +803,16 @@ def process_audio_streaming(session_id, audio_buffer):
     try:
         # Save accumulated audio to temp file
         audio_buffer.seek(0)
+        audio_data = audio_buffer.read()
+        
+        # Check if we have valid audio data
+        if len(audio_data) < 100:  # WebM header is at least 100 bytes
+            socketio.emit('error', {'message': 'Audio data too short or corrupted'}, room=session_id)
+            return
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix=".webm", dir=config.TEMP_DIR) as tmp:
-            tmp.write(audio_buffer.read())
+            tmp.write(audio_data)
+            tmp.flush()
             audio_path = tmp.name
         
         # Clear buffer for next recording

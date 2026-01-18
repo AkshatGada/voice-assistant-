@@ -8,10 +8,9 @@ SERVER_HOST = os.getenv("HOST", "127.0.0.1")
 DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
 # Model Paths
-# Note: distil-whisper is not available in MLX format yet
-# Using mlx-community/whisper-small for faster STT (better than tiny)
-# Available MLX models: whisper-tiny, whisper-base, whisper-small, whisper-medium
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "mlx-community/whisper-small")
+# Using mlx-community/whisper-tiny (default, guaranteed to exist)
+# This is the fastest Whisper model and works well for voice commands
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "mlx-community/whisper-tiny")
 GEMMA_MODEL_PATH = os.getenv(
     "GEMMA_MODEL_PATH",
     "/Users/agada/.lmstudio/models/mlx-community/gemma-3-4b-it-qat-4bit"
@@ -27,14 +26,19 @@ KOKORO_SAMPLE_RATE = 24000
 
 # LLM Configuration
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "100"))  # Reduced from 512 for faster voice responses
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "200"))  # Increased for more complete responses
 
 # Optimized System Prompt for Jarvis (reduced from 1964 to ~150 chars for faster LLM processing)
 SYSTEM_PROMPT = """You are Jarvis, a helpful voice assistant. Provide natural, concise responses under 20 words. Use contractions (I'll, I'm) for a conversational feel. Be warm and direct."""
 
 # Filler configuration for psychological latency masking
 ENABLE_FILLER_TOKENS = os.getenv("ENABLE_FILLER_TOKENS", "true").lower() == "true"
-FILLER_TOKENS = ["Sure,", "Okay,", "Alright,", "Let me see,"]
+FILLER_TOKENS = [
+    "Sure,", "Okay,", "Alright,", "Let me see,", "Got it,", 
+    "Right,", "Absolutely,", "Of course,", "Well,", "Hmm,",
+    "Indeed,", "Certainly,", "I see,", "Interesting,", "Ah,",
+    "Yes,", "Understood,", "Fair enough,", "Good question,", "Let me think,"
+]
 
 # WebSocket Configuration
 ENABLE_WEBSOCKET_MODE = os.getenv("ENABLE_WS", "true").lower() == "true"

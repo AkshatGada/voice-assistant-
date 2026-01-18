@@ -102,22 +102,14 @@ function setupMediaRecorder(stream) {
     mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
             audioChunks.push(event.data);
-            
-            // Stream chunk via WebSocket if available
-            if (typeof sendAudioChunk !== 'undefined' && typeof window.useWebSocket !== 'undefined' && window.useWebSocket) {
-                sendAudioChunk(event.data);
-            }
+            // Note: We accumulate chunks and send complete audio on stop
+            // Streaming individual chunks causes WebM format corruption
         }
     };
     
     mediaRecorder.onstop = () => {
-        // If using WebSocket, signal end
-        if (typeof sendAudioEnd !== 'undefined' && typeof window.useWebSocket !== 'undefined' && window.useWebSocket && typeof window.socket !== 'undefined' && window.socket && window.socket.connected) {
-            sendAudioEnd();
-        } else {
-            // Fallback to HTTP
-            processRecording();
-        }
+        // Process the complete recording
+        processRecording();
     };
 }
 
@@ -231,11 +223,14 @@ async function processRecording() {
             return;
         }
         
-        // Convert to WAV format using Web Audio API
-        const wavBlob = await convertToWav(audioBlob);
-        
-        // Send to backend
-        await sendToBackend(wavBlob);
+        // Check if WebSocket is available and connected
+        if (typeof window.socket !== 'undefined' && window.socket && window.socket.connected && typeof window.useWebSocket !== 'undefined' && window.useWebSocket) {
+            // Send via WebSocket
+            await sendToBackendWebSocket(audioBlob);
+        } else {
+            // Fallback to HTTP
+            await sendToBackendBlocking(audioBlob);
+        }
         
     } catch (err) {
         console.error('Error processing recording:', err);
@@ -250,20 +245,28 @@ async function convertToWav(audioBlob) {
     return audioBlob;
 }
 
-async function sendToBackend(audioBlob) {
-    const formData = new FormData();
-    formData.append('audio', audioBlob, 'recording.webm');
-    
-    // Check if streaming is enabled (default to non-streaming for now)
-    const useStreaming = false; // Can be enabled via config later
-    
-    if (useStreaming) {
-        // Streaming mode - use Server-Sent Events
-        await sendToBackendStreaming(audioBlob);
-    } else {
-        // Non-streaming mode - original implementation
-        await sendToBackendBlocking(audioBlob);
-    }
+async function sendToBackendWebSocket(audioBlob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        
+        reader.onload = () => {
+            const arrayBuffer = reader.result;
+            const base64 = btoa(
+                new Uint8Array(arrayBuffer)
+                    .reduce((data, byte) => data + String.fromCharCode(byte), '')
+            );
+            
+            // Send complete audio file via WebSocket
+            window.socket.emit('audio_complete', { audio: base64 });
+            resolve();
+        };
+        
+        reader.onerror = () => {
+            reject(new Error('Failed to read audio blob'));
+        };
+        
+        reader.readAsArrayBuffer(audioBlob);
+    });
 }
 
 async function sendToBackendBlocking(audioBlob) {
