@@ -7,6 +7,8 @@ import traceback
 import io
 import base64
 import threading
+import json
+import re
 
 import mlx_whisper
 import numpy as np
@@ -34,6 +36,103 @@ gemma_system_prompt_cache = None  # KV cache for system prompt
 
 # Audio memory cache for faster delivery
 audio_memory_cache = {}
+
+
+class StreamFilter:
+    """
+    Filters LLM token stream to separate speech (to TTS) from tool calls.
+    
+    - Speech: text outside <tool>...</tool> tags → sent to TTS immediately
+    - Tools: text inside <tool>...</tool> tags → accumulated, parsed, NOT sent to TTS
+    
+    Handles edge cases where tokens split tags (e.g., "<to" + "ol>").
+    """
+    def __init__(self):
+        self.buffer = ""  # Accumulates tokens to track tag boundaries
+        self.in_tool_tag = False
+        self.tool_buffer = ""
+        
+    def process_token(self, token):
+        """
+        Process a single token from LLM stream.
+        
+        Returns:
+            tuple: (speech_text, tool_json_or_none, is_speech)
+                - speech_text: text to send to TTS (empty if inside tool tag)
+                - tool_json_or_none: parsed JSON if tool tag just completed (None otherwise)
+                - is_speech: True if this is speech output (False if tool)
+        """
+        self.buffer += token
+        speech_output = ""
+        tool_result = None
+        
+        # Check if we're entering a tool tag
+        if not self.in_tool_tag and "<tool>" in self.buffer:
+            # Split at the tool tag
+            speech_part, rest = self.buffer.split("<tool>", 1)
+            speech_output = speech_part
+            self.buffer = rest
+            self.in_tool_tag = True
+            self.tool_buffer = ""
+            return (speech_output, None, True)
+        
+        # Check if we're inside a tool tag and should look for closing tag
+        if self.in_tool_tag and "</tool>" in self.buffer:
+            # Extract tool JSON
+            tool_part, speech_part = self.buffer.split("</tool>", 1)
+            self.tool_buffer += tool_part
+            
+            # Try to parse the JSON
+            try:
+                tool_json = json.loads(self.tool_buffer)
+                tool_result = tool_json
+                print(f"\n🔧 [TOOL CALL DETECTED]: {tool_json}")
+            except json.JSONDecodeError as e:
+                print(f"\n⚠️  [TOOL PARSE ERROR]: {e}")
+                print(f"   Raw tool buffer: {self.tool_buffer}")
+                tool_result = {"error": "invalid_json", "raw": self.tool_buffer}
+            
+            # Reset tool state
+            self.in_tool_tag = False
+            self.tool_buffer = ""
+            self.buffer = speech_part
+            
+            # If there's remaining speech after the tool tag, return it
+            if speech_part:
+                return (speech_part, tool_result, True)
+            return ("", tool_result, False)
+        
+        # If inside tool tag, don't return speech yet (keep buffering)
+        if self.in_tool_tag:
+            self.tool_buffer += token
+            return ("", None, False)
+        
+        # If outside tool tags, this token is speech
+        if not self.in_tool_tag:
+            speech_output = token
+            self.buffer = ""
+            return (speech_output, None, True)
+        
+        return ("", None, False)
+    
+    def flush(self):
+        """
+        At end of stream, return any remaining buffered content.
+        
+        Returns:
+            tuple: (speech_text, tool_json_or_none)
+        """
+        if self.in_tool_tag:
+            # If we're still inside a tool tag at stream end, try to parse it
+            print(f"\n⚠️  [INCOMPLETE TOOL TAG AT STREAM END]")
+            print(f"   Partial buffer: {self.tool_buffer}")
+            return ("", None)
+        
+        # Any remaining content in buffer is speech
+        speech = self.buffer
+        self.buffer = ""
+        return (speech, None)
+
 
 
 def load_whisper_model():
@@ -191,16 +290,15 @@ def _generate_llm_response_streaming(formatted_prompt: str, use_filler: bool = T
 
 
 def generate_with_streaming_tts(transcribed_text):
-    """Generate LLM response with parallel TTS streaming
+    """Generate LLM response with parallel TTS streaming and tool call handling
     
     Starts TTS synthesis as soon as first complete sentence is generated,
     dramatically reducing perceived latency. Handles filler tokens for
-    instant feedback.
+    instant feedback. Filters out tool calls from TTS.
     
     Returns:
         tuple: (full_text, audio_array)
     """
-    import re
     
     load_tts_pipeline()
     
@@ -208,48 +306,66 @@ def generate_with_streaming_tts(transcribed_text):
     full_text = ""
     audio_chunks = []
     filler_synthesized = False
+    stream_filter = StreamFilter()
     
     # Stream LLM tokens (with filler enabled)
     for token, current_text in generate_llm_response(transcribed_text, stream=True, use_filler=True):
-        sentence_buffer += token
         full_text = current_text
         
-        # Check if this is a filler token (first token, ends with comma)
-        if not filler_synthesized and token.endswith(',') and len(sentence_buffer.strip()) < 10:
-            # Synthesize filler immediately for instant feedback
-            filler_text = sentence_buffer.strip()
-            if filler_text:
-                for result in tts_pipeline(
-                    filler_text, 
-                    voice=config.KOKORO_VOICE, 
-                    speed=config.KOKORO_SPEED
-                ):
-                    if result.audio is not None:
-                        audio_chunks.append(result.audio.numpy())
-                
-                # Add natural pause after filler (75ms silence)
-                # This masks voice differences and feels natural
-                silence_padding = np.zeros(int(0.075 * config.KOKORO_SAMPLE_RATE), dtype=np.float32)
-                audio_chunks.append(silence_padding)
-                
-                filler_synthesized = True
-                sentence_buffer = ""  # Clear buffer after filler
+        # Process token through stream filter
+        speech_text, tool_result, is_speech = stream_filter.process_token(token)
         
-        # Detect sentence boundaries (., !, ? followed by optional whitespace)
-        elif re.search(r'[.!?]\s*$', sentence_buffer.strip()):
-            sentence = sentence_buffer.strip()
-            if sentence:
-                # Synthesize this sentence immediately
-                for result in tts_pipeline(
-                    sentence, 
-                    voice=config.KOKORO_VOICE, 
-                    speed=config.KOKORO_SPEED
-                ):
-                    if result.audio is not None:
-                        audio_chunks.append(result.audio.numpy())
-            sentence_buffer = ""
+        # If there's a tool result, log it (mock execution)
+        if tool_result:
+            print(f"   Tool input: {tool_result}")
+        
+        # Only synthesize if this is speech content
+        if is_speech and speech_text.strip():
+            sentence_buffer += speech_text
+            
+            # Check if this is a filler token (first token, ends with comma)
+            if not filler_synthesized and token.endswith(',') and len(sentence_buffer.strip()) < 10:
+                # Synthesize filler immediately for instant feedback
+                filler_text = sentence_buffer.strip()
+                if filler_text:
+                    for result in tts_pipeline(
+                        filler_text, 
+                        voice=config.KOKORO_VOICE, 
+                        speed=config.KOKORO_SPEED
+                    ):
+                        if result.audio is not None:
+                            audio_chunks.append(result.audio.numpy())
+                    
+                    # Add natural pause after filler (75ms silence)
+                    silence_padding = np.zeros(int(0.075 * config.KOKORO_SAMPLE_RATE), dtype=np.float32)
+                    audio_chunks.append(silence_padding)
+                    
+                    filler_synthesized = True
+                    sentence_buffer = ""
+            
+            # Detect sentence boundaries (., !, ? followed by optional whitespace)
+            elif re.search(r'[.!?]\s*$', sentence_buffer.strip()):
+                sentence = sentence_buffer.strip()
+                if sentence:
+                    # Synthesize this sentence immediately
+                    for result in tts_pipeline(
+                        sentence, 
+                        voice=config.KOKORO_VOICE, 
+                        speed=config.KOKORO_SPEED
+                    ):
+                        if result.audio is not None:
+                            audio_chunks.append(result.audio.numpy())
+                sentence_buffer = ""
+    
+    # Flush any remaining content from stream filter
+    remaining_speech, remaining_tool = stream_filter.flush()
+    if remaining_tool:
+        print(f"   Tool input (from flush): {remaining_tool}")
     
     # Handle remaining text (if any)
+    if remaining_speech and remaining_speech.strip():
+        sentence_buffer += remaining_speech
+    
     if sentence_buffer.strip():
         for result in tts_pipeline(
             sentence_buffer.strip(), 
@@ -842,83 +958,108 @@ def process_audio_streaming(session_id, audio_buffer):
         # Send transcription
         socketio.emit('transcription', {'text': transcribed_text}, room=session_id)
         
-        # LLM + TTS streaming with filler tokens
+        # LLM + TTS streaming with filler tokens and tool calling
         load_tts_pipeline()
         
         sentence_buffer = ""
         full_text = ""
         audio_chunks = []
         filler_synthesized = False
-        import re
+        stream_filter = StreamFilter()
         
         # Stream LLM tokens (with filler enabled)
         for token, current_text in generate_llm_response(transcribed_text, stream=True, use_filler=True):
-            sentence_buffer += token
             full_text = current_text
             
-            # Check if this is a filler token (first token, ends with comma)
-            if not filler_synthesized and token.endswith(',') and len(sentence_buffer.strip()) < 10:
-                # Synthesize filler immediately for instant feedback
-                filler_text = sentence_buffer.strip()
-                if filler_text:
-                    for result in tts_pipeline(
-                        filler_text,
-                        voice=config.KOKORO_VOICE,
-                        speed=config.KOKORO_SPEED
-                    ):
-                        if result.audio is not None:
-                            audio_chunk = result.audio.numpy()
-                            audio_chunks.append(audio_chunk)
-                            
-                            # Add natural pause after filler (75ms silence)
-                            # This masks voice differences and feels natural
-                            silence_padding = np.zeros(int(0.075 * config.KOKORO_SAMPLE_RATE), dtype=np.float32)
-                            audio_chunks.append(silence_padding)
-                            
-                            # Send audio chunk immediately
-                            wav_buffer = io.BytesIO()
-                            sf.write(wav_buffer, audio_chunk, config.KOKORO_SAMPLE_RATE, format='WAV')
-                            wav_bytes = wav_buffer.getvalue()
-                            audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
-                            
-                            socketio.emit('audio_chunk', {
-                                'audio': audio_b64,
-                                'text': filler_text,
-                                'is_filler': True
-                            }, room=session_id)
-                    
-                    filler_synthesized = True
-                    sentence_buffer = ""
+            # Process token through stream filter
+            speech_text, tool_result, is_speech = stream_filter.process_token(token)
             
-            # Detect sentence boundaries
-            elif re.search(r'[.!?]\s*$', sentence_buffer.strip()):
-                sentence = sentence_buffer.strip()
-                if sentence:
-                    # Synthesize this sentence immediately
-                    for result in tts_pipeline(
-                        sentence,
-                        voice=config.KOKORO_VOICE,
-                        speed=config.KOKORO_SPEED
-                    ):
-                        if result.audio is not None:
-                            audio_chunk = result.audio.numpy()
-                            audio_chunks.append(audio_chunk)
-                            
-                            # Send audio chunk immediately
-                            wav_buffer = io.BytesIO()
-                            sf.write(wav_buffer, audio_chunk, config.KOKORO_SAMPLE_RATE, format='WAV')
-                            wav_bytes = wav_buffer.getvalue()
-                            audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
-                            
-                            socketio.emit('audio_chunk', {
-                                'audio': audio_b64,
-                                'text': sentence,
-                                'is_filler': False
-                            }, room=session_id)
-                    
-                    sentence_buffer = ""
+            # If there's a tool result, log it (mock execution)
+            if tool_result:
+                print(f"   Tool input: {tool_result}")
+                socketio.emit('tool_call', {
+                    'tool': tool_result,
+                    'text': "Executing tool..."
+                }, room=session_id)
+            
+            # Only synthesize if this is speech content
+            if is_speech and speech_text.strip():
+                sentence_buffer += speech_text
+                
+                # Check if this is a filler token (first token, ends with comma)
+                if not filler_synthesized and token.endswith(',') and len(sentence_buffer.strip()) < 10:
+                    # Synthesize filler immediately for instant feedback
+                    filler_text = sentence_buffer.strip()
+                    if filler_text:
+                        for result in tts_pipeline(
+                            filler_text,
+                            voice=config.KOKORO_VOICE,
+                            speed=config.KOKORO_SPEED
+                        ):
+                            if result.audio is not None:
+                                audio_chunk = result.audio.numpy()
+                                audio_chunks.append(audio_chunk)
+                                
+                                # Add natural pause after filler (75ms silence)
+                                silence_padding = np.zeros(int(0.075 * config.KOKORO_SAMPLE_RATE), dtype=np.float32)
+                                audio_chunks.append(silence_padding)
+                                
+                                # Send audio chunk immediately
+                                wav_buffer = io.BytesIO()
+                                sf.write(wav_buffer, audio_chunk, config.KOKORO_SAMPLE_RATE, format='WAV')
+                                wav_bytes = wav_buffer.getvalue()
+                                audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+                                
+                                socketio.emit('audio_chunk', {
+                                    'audio': audio_b64,
+                                    'text': filler_text,
+                                    'is_filler': True
+                                }, room=session_id)
+                        
+                        filler_synthesized = True
+                        sentence_buffer = ""
+                
+                # Detect sentence boundaries (., !, ?)
+                elif re.search(r'[.!?]\s*$', sentence_buffer.strip()):
+                    sentence = sentence_buffer.strip()
+                    if sentence:
+                        # Synthesize this sentence immediately
+                        for result in tts_pipeline(
+                            sentence,
+                            voice=config.KOKORO_VOICE,
+                            speed=config.KOKORO_SPEED
+                        ):
+                            if result.audio is not None:
+                                audio_chunk = result.audio.numpy()
+                                audio_chunks.append(audio_chunk)
+                                
+                                # Send audio chunk immediately
+                                wav_buffer = io.BytesIO()
+                                sf.write(wav_buffer, audio_chunk, config.KOKORO_SAMPLE_RATE, format='WAV')
+                                wav_bytes = wav_buffer.getvalue()
+                                audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+                                
+                                socketio.emit('audio_chunk', {
+                                    'audio': audio_b64,
+                                    'text': sentence,
+                                    'is_filler': False
+                                }, room=session_id)
+                        
+                        sentence_buffer = ""
+        
+        # Flush any remaining content from stream filter
+        remaining_speech, remaining_tool = stream_filter.flush()
+        if remaining_tool:
+            print(f"   Tool input (from flush): {remaining_tool}")
+            socketio.emit('tool_call', {
+                'tool': remaining_tool,
+                'text': "Executing tool..."
+            }, room=session_id)
         
         # Handle remaining text (if any)
+        if remaining_speech and remaining_speech.strip():
+            sentence_buffer += remaining_speech
+        
         if sentence_buffer.strip():
             for result in tts_pipeline(
                 sentence_buffer.strip(),

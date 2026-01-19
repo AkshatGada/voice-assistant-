@@ -28,8 +28,17 @@ KOKORO_SAMPLE_RATE = 24000
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "200"))  # Increased for more complete responses
 
-# Optimized System Prompt for Jarvis (reduced from 1964 to ~150 chars for faster LLM processing)
-SYSTEM_PROMPT = """You are Jarvis, a helpful voice assistant. Provide natural, concise responses under 20 words. Use contractions (I'll, I'm) for a conversational feel. Be warm and direct."""
+# Optimized System Prompt for Jarvis with Tool Calling Support
+SYSTEM_PROMPT = """You are Jarvis, a helpful voice assistant. You can speak naturally AND call tools when needed. 
+
+IMPORTANT: When you need to use a tool:
+1. Speak naturally to the user first (e.g., "Let me search for that")
+2. Then wrap the JSON call in <tool>...</tool> tags
+3. Format: Speak naturally. <tool>{"name": "tool_name", "input": "value"}</tool> Continue speaking if needed.
+
+Always keep speech natural and under 20 words when not using tools. Use contractions (I'll, I'm). Be warm and direct.
+
+Available tools: search_files, get_weather, execute_command (mock for now)."""
 
 # Filler configuration for psychological latency masking
 ENABLE_FILLER_TOKENS = os.getenv("ENABLE_FILLER_TOKENS", "true").lower() == "true"
