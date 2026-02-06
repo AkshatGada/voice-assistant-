@@ -1,8 +1,7 @@
-flask>=2.3.0
-flask-cors>=4.0.0
+flask
+flask-cors
 mlx-whisper
-mlx-lm
-kokoro>=0.7.13
 numpy
 soundfile
-werkzeug
+kokoro
+google-generativeai
